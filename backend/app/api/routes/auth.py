@@ -11,12 +11,95 @@ from app.models.models import User, UserRole
 from app.schemas.schemas import (
     LoginRequest, Token, UserCreate, UserResponse, UserUpdate
 )
+from app.services.auth.ldap_service import ldap_service
 
 router = APIRouter(prefix="/auth", tags=["Authentication"])
 
 
 @router.post("/login", response_model=Token)
 async def login(request: LoginRequest, db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(User).where(User.username == request.username))
+    user = result.scalar_one_or_none()
+    
+    local_auth = False
+    
+    if user:
+        local_auth = True
+        if not verify_password(request.password, user.hashed_password):
+            local_auth = False
+    
+    if not local_auth:
+        ldap_result = ldap_service.authenticate(request.username, request.password)
+        
+        if not ldap_result.get("success"):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Incorrect username or password",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        
+        ldap_user = ldap_result.get("user", {})
+        
+        if not user:
+            result = await db.execute(select(User).where(User.email == ldap_user.get("email")))
+            if result.scalar_one_or_none():
+                result = await db.execute(select(User).where(User.username == request.username))
+                user = result.scalar_one_or_none()
+            else:
+                mapped_role = ldap_service.map_group_to_role(
+                    ldap_user.get("groups", ["Domain Users"])[0]
+                )
+                
+                try:
+                    role = UserRole(mapped_role)
+                except:
+                    role = UserRole.OPERATOR
+                
+                user = User(
+                    username=request.username,
+                    email=ldap_user.get("email", f"{request.username}@bank.com"),
+                    full_name=ldap_user.get("display_name", request.username),
+                    hashed_password=get_password_hash(f"ldap_{request.username}"),
+                    role=role
+                )
+                db.add(user)
+                await db.commit()
+                await db.refresh(user)
+        else:
+            mapped_role = ldap_service.map_group_to_role(
+                ldap_user.get("groups", ["Domain Users"])[0]
+            )
+            
+            try:
+                user.role = UserRole(mapped_role)
+                await db.commit()
+            except:
+                pass
+    
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect username or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    
+    if not user.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="User account is disabled"
+        )
+    
+    access_token = create_access_token(data={"sub": user.username})
+    refresh_token = create_refresh_token(data={"sub": user.username})
+    
+    return Token(
+        access_token=access_token,
+        refresh_token=refresh_token
+    )
+
+
+@router.post("/login/local", response_model=Token)
+async def login_local_only(request: LoginRequest, db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(User).where(User.username == request.username))
     user = result.scalar_one_or_none()
     
